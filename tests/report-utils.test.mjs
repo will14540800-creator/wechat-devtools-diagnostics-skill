@@ -6,6 +6,7 @@ import {
   buildDevtoolsCliPlan,
   detectCliPort,
   determineDevtoolsOpenAction,
+  filterLauncherLogSince,
   pickLatestExistingPath,
   trimEntries,
   summarizeTextBlock,
@@ -60,6 +61,38 @@ test('summarizeTextBlock keeps tail lines and drops empties', () => {
   assert.equal(result, 'line-2\nline-3');
 });
 
+test('filterLauncherLogSince keeps only current-run launcher lines', () => {
+  const startedAt = new Date(2026, 2, 24, 17, 20, 0);
+  const result = filterLauncherLogSince(
+    [
+      '[LAUNCHER]2026/03/24 17:19:59 daemon.go:1: old',
+      '[LAUNCHER]2026/03/24 17:20:15 daemon.go:2: current',
+      '[LAUNCHER]2026/03/24 17:20:16 daemon.go:3: current-2',
+    ].join('\n'),
+    startedAt,
+    20,
+  );
+
+  assert.equal(
+    result,
+    [
+      '[LAUNCHER]2026/03/24 17:20:15 daemon.go:2: current',
+      '[LAUNCHER]2026/03/24 17:20:16 daemon.go:3: current-2',
+    ].join('\n'),
+  );
+});
+
+test('filterLauncherLogSince returns empty text when launcher did not restart this run', () => {
+  const startedAt = new Date(2026, 2, 24, 17, 20, 0);
+  const result = filterLauncherLogSince(
+    '[LAUNCHER]2026/03/24 17:19:59 daemon.go:1: old',
+    startedAt,
+    20,
+  );
+
+  assert.equal(result, '');
+});
+
 test('buildCommandInvocation wraps Windows bat paths with spaces via cmd.exe', () => {
   const invocation = buildCommandInvocation(
     'win32',
@@ -104,7 +137,7 @@ test('determineDevtoolsOpenAction launches when devtools is not open', () => {
   assert.equal(action, 'launch-target-project');
 });
 
-test('buildDevtoolsCliPlan refreshes current project via close then open-other', () => {
+test('buildDevtoolsCliPlan refreshes current project via auto-preview only', () => {
   const plan = buildDevtoolsCliPlan({
     action: 'refresh-existing-project',
     projectPath: 'D:\\My Program\\HGsh1.0',

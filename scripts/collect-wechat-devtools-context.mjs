@@ -10,6 +10,7 @@ import {
   buildDevtoolsCliPlan,
   detectCliPort,
   determineDevtoolsOpenAction,
+  filterLauncherLogSince,
   pickLatestExistingPath,
   summarizeTextBlock,
   trimEntries,
@@ -221,7 +222,7 @@ function runBuildCommand(buildCommand, options = {}) {
   return runCli(buildCommand.command, buildCommand.args, options);
 }
 
-function collectLaunchLog(profileDirs) {
+function collectLaunchLog(profileDirs, startedAt) {
   const candidates = profileDirs.map((profileDir) => {
     const launchPath = path.join(profileDir, 'WeappLog', 'launch.log');
     return {
@@ -232,7 +233,7 @@ function collectLaunchLog(profileDirs) {
   });
 
   const latestPath = pickLatestExistingPath(candidates);
-  return latestPath ? summarizeTextBlock(readUtf8Safe(latestPath), 120) : '';
+  return latestPath ? filterLauncherLogSince(readUtf8Safe(latestPath), startedAt, 120) : '';
 }
 
 function collectEditorLogs(profileDirs) {
@@ -619,6 +620,7 @@ async function collectMiniProgramSnapshot({ autoPort, outputDir, settleMs }) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  const sessionStartedAt = new Date();
   const projectPath = path.resolve(args.project);
   const outputDir = path.resolve(args.outputDir);
   ensureDir(outputDir);
@@ -694,6 +696,7 @@ async function main() {
   );
 
   const report = {
+    sessionStartedAt: sessionStartedAt.toISOString(),
     createdAt: new Date().toISOString(),
     projectPath,
     autoPort,
@@ -719,7 +722,7 @@ async function main() {
     },
     miniProgram,
     logs: {
-      launch: collectLaunchLog(profileDirs),
+      launch: collectLaunchLog(profileDirs, sessionStartedAt),
       editor: collectEditorLogs(profileDirs),
       ideScreenshot,
     },
