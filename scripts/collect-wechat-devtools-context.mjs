@@ -12,6 +12,7 @@ import {
   determineDevtoolsOpenAction,
   filterLauncherLogSince,
   pickLatestExistingPath,
+  resolvePreferredBuildCommand,
   summarizeTextBlock,
   trimEntries,
 } from '../lib/report-utils.mjs';
@@ -393,31 +394,26 @@ function collectProjectHints(projectPath) {
 }
 
 function detectBuildCommand(projectPath) {
-  const packageJsonPath = path.join(projectPath, 'package.json');
-  if (!fs.existsSync(packageJsonPath)) {
-    return null;
-  }
+  const rootPackageJsonPath = path.join(projectPath, 'package.json');
+  const mobilePackageJsonPath = path.join(projectPath, 'taro-mobile', 'package.json');
 
   try {
-    const packageJson = JSON.parse(readUtf8Safe(packageJsonPath));
-    const scripts = packageJson.scripts ?? {};
-    const preferredScripts = ['mobile:build', 'build:weapp', 'weapp:build', 'build'];
+    const rootScripts = fs.existsSync(rootPackageJsonPath)
+      ? JSON.parse(readUtf8Safe(rootPackageJsonPath)).scripts ?? {}
+      : {};
+    const mobileScripts = fs.existsSync(mobilePackageJsonPath)
+      ? JSON.parse(readUtf8Safe(mobilePackageJsonPath)).scripts ?? {}
+      : {};
 
-    for (const scriptName of preferredScripts) {
-      if (scripts[scriptName]) {
-        return {
-          packageJsonPath,
-          scriptName,
-          command: process.platform === 'win32' ? 'npm.cmd' : 'npm',
-          args: ['run', scriptName],
-        };
-      }
-    }
+    return resolvePreferredBuildCommand({
+      projectPath,
+      rootScripts,
+      mobileScripts,
+      platform: process.platform,
+    });
   } catch {
     return null;
   }
-
-  return null;
 }
 
 function buildDiagnosis({ projectHints, cli, miniProgram, logs, buildFallback, preflightReload }) {
@@ -658,7 +654,7 @@ async function main() {
   // instead of stale DevTools cache state.
   const preflightReload = buildCommand
     ? runBuildCommand(buildCommand, {
-        cwd: projectPath,
+        cwd: buildCommand.cwd ?? projectPath,
         timeout: 180000,
       })
     : null;
@@ -698,7 +694,7 @@ async function main() {
   const buildFallback =
     !miniProgram.currentPage && buildCommand
       ? runBuildCommand(buildCommand, {
-          cwd: projectPath,
+          cwd: buildCommand.cwd ?? projectPath,
           timeout: 180000,
         })
       : null;

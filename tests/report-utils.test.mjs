@@ -8,6 +8,7 @@ import {
   determineDevtoolsOpenAction,
   filterLauncherLogSince,
   pickLatestExistingPath,
+  resolvePreferredBuildCommand,
   trimEntries,
   summarizeTextBlock,
 } from '../lib/report-utils.mjs';
@@ -166,4 +167,40 @@ test('buildDevtoolsCliPlan launches closed devtools via open only', () => {
   assert.deepEqual(plan, [
     ['open', '--project', 'D:\\My Program\\HGsh1.0', '--debug'],
   ]);
+});
+
+test('resolvePreferredBuildCommand prefers direct taro weapp build over npm wrapper scripts', () => {
+  const command = resolvePreferredBuildCommand({
+    projectPath: 'D:\\My Program\\HGsh1.0',
+    rootScripts: { 'mobile:build': 'npm run build:weapp --prefix taro-mobile' },
+    mobileScripts: { 'build:weapp': 'node ./node_modules/@tarojs/cli/bin/taro build --type weapp' },
+    platform: 'win32',
+  });
+
+  assert.deepEqual(command, {
+    packageJsonPath: 'D:\\My Program\\HGsh1.0\\taro-mobile\\package.json',
+    scriptName: 'build:weapp',
+    command: 'node',
+    args: ['./node_modules/@tarojs/cli/bin/taro', 'build', '--type', 'weapp'],
+    cwd: 'D:\\My Program\\HGsh1.0\\taro-mobile',
+    mode: 'direct-weapp-build',
+  });
+});
+
+test('resolvePreferredBuildCommand falls back to npm script when direct weapp build is unavailable', () => {
+  const command = resolvePreferredBuildCommand({
+    projectPath: 'D:\\My Program\\HGsh1.0',
+    rootScripts: { build: 'vite build' },
+    mobileScripts: {},
+    platform: 'win32',
+  });
+
+  assert.deepEqual(command, {
+    packageJsonPath: 'D:\\My Program\\HGsh1.0\\package.json',
+    scriptName: 'build',
+    command: 'npm.cmd',
+    args: ['run', 'build'],
+    cwd: 'D:\\My Program\\HGsh1.0',
+    mode: 'npm-script',
+  });
 });
