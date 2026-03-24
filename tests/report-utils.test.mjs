@@ -111,8 +111,7 @@ test('buildDevtoolsCliPlan refreshes current project via close then open-other',
   });
 
   assert.deepEqual(plan, [
-    ['close', '--project', 'D:\\My Program\\HGsh1.0', '--debug'],
-    ['open-other', '--project', 'D:\\My Program\\HGsh1.0', '--debug'],
+    ['auto-preview', '--project', 'D:\\My Program\\HGsh1.0', '--debug'],
   ]);
 });
 
