@@ -137,15 +137,13 @@ test('determineDevtoolsOpenAction launches when devtools is not open', () => {
   assert.equal(action, 'launch-target-project');
 });
 
-test('buildDevtoolsCliPlan refreshes current project via auto-preview only', () => {
+test('buildDevtoolsCliPlan leaves already-open project untouched', () => {
   const plan = buildDevtoolsCliPlan({
     action: 'refresh-existing-project',
     projectPath: 'D:\\My Program\\HGsh1.0',
   });
 
-  assert.deepEqual(plan, [
-    ['auto-preview', '--project', 'D:\\My Program\\HGsh1.0', '--debug'],
-  ]);
+  assert.deepEqual(plan, []);
 });
 
 test('buildDevtoolsCliPlan switches other project via open-other only', () => {

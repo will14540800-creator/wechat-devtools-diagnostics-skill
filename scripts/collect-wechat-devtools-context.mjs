@@ -170,6 +170,17 @@ function runCli(cliPath, args, options = {}) {
 }
 
 async function runDevtoolsCliPlan(cliPath, plan, options = {}) {
+  if (!Array.isArray(plan) || plan.length === 0) {
+    return {
+      status: 0,
+      args: [],
+      stdout: 'skipped project-open CLI because target project is already open; using external rebuild only',
+      stderr: '',
+      error: null,
+      steps: [],
+    };
+  }
+
   const steps = [];
 
   for (const args of plan) {
@@ -641,6 +652,7 @@ async function main() {
     action: devtoolsOpenAction,
     projectPath,
   });
+  const reuseOpenProject = devtoolsOpenAction === 'refresh-existing-project';
 
   // Hot-reload surrogate: rebuild first so diagnostics read the latest generated output
   // instead of stale DevTools cache state.
@@ -661,13 +673,15 @@ async function main() {
     { cwd: projectPath, stepDelayMs: 2000 },
   );
 
-  const cliAuto = runCli(
-    cliPath,
-    ['auto', '--project', projectPath, '--auto-port', String(autoPort), '--debug', '--trust-project'],
-    { cwd: projectPath },
-  );
+  const cliAuto = reuseOpenProject
+    ? null
+    : runCli(
+        cliPath,
+        ['auto', '--project', projectPath, '--auto-port', String(autoPort), '--debug', '--trust-project'],
+        { cwd: projectPath },
+      );
 
-  const cliPreview = args.withPreview
+  const cliPreview = args.withPreview && !reuseOpenProject
     ? runCli(
         cliPath,
         ['preview', '--project', projectPath, '--debug', '--info-output', path.join(outputDir, 'preview-info.json')],
