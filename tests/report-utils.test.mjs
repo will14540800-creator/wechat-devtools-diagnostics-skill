@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   buildCommandInvocation,
+  buildDevtoolsCliPlan,
   detectCliPort,
   determineDevtoolsOpenAction,
   pickLatestExistingPath,
@@ -101,4 +102,38 @@ test('determineDevtoolsOpenAction launches when devtools is not open', () => {
   });
 
   assert.equal(action, 'launch-target-project');
+});
+
+test('buildDevtoolsCliPlan refreshes current project via close then open-other', () => {
+  const plan = buildDevtoolsCliPlan({
+    action: 'refresh-existing-project',
+    projectPath: 'D:\\My Program\\HGsh1.0',
+  });
+
+  assert.deepEqual(plan, [
+    ['close', '--project', 'D:\\My Program\\HGsh1.0', '--debug'],
+    ['open-other', '--project', 'D:\\My Program\\HGsh1.0', '--debug'],
+  ]);
+});
+
+test('buildDevtoolsCliPlan switches other project via open-other only', () => {
+  const plan = buildDevtoolsCliPlan({
+    action: 'switch-to-target-project',
+    projectPath: 'D:\\My Program\\HGsh1.0',
+  });
+
+  assert.deepEqual(plan, [
+    ['open-other', '--project', 'D:\\My Program\\HGsh1.0', '--debug'],
+  ]);
+});
+
+test('buildDevtoolsCliPlan launches closed devtools via open only', () => {
+  const plan = buildDevtoolsCliPlan({
+    action: 'launch-target-project',
+    projectPath: 'D:\\My Program\\HGsh1.0',
+  });
+
+  assert.deepEqual(plan, [
+    ['open', '--project', 'D:\\My Program\\HGsh1.0', '--debug'],
+  ]);
 });

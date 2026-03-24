@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 
 import {
   buildCommandInvocation,
+  buildDevtoolsCliPlan,
   detectCliPort,
   determineDevtoolsOpenAction,
   pickLatestExistingPath,
@@ -165,6 +166,59 @@ function runCli(cliPath, args, options = {}) {
     stderr: summarizeTextBlock(result.stderr, 120),
     error: result.error ? String(result.error.message ?? result.error) : null,
   };
+}
+
+async function runDevtoolsCliPlan(cliPath, plan, options = {}) {
+  const steps = [];
+
+  for (const args of plan) {
+    const result = runCli(cliPath, args, options);
+    steps.push(result);
+
+    if (result.status !== 0) {
+      return {
+        status: result.status,
+        args: plan.flat(),
+        stdout: steps.map((item) => item.stdout).filter(Boolean).join('\n'),
+        stderr: steps.map((item) => item.stderr).filter(Boolean).join('\n'),
+        error: steps.map((item) => item.error).filter(Boolean).join('\n') || null,
+        steps,
+      };
+    }
+
+    await sleep(options.stepDelayMs ?? 1500);
+  }
+
+  return {
+    status: 0,
+    args: plan.flat(),
+    stdout: steps.map((item) => item.stdout).filter(Boolean).join('\n'),
+    stderr: steps.map((item) => item.stderr).filter(Boolean).join('\n'),
+    error: steps.map((item) => item.error).filter(Boolean).join('\n') || null,
+    steps,
+  };
+}
+
+function runBuildCommand(buildCommand, options = {}) {
+  if (!buildCommand) {
+    return null;
+  }
+
+  const commandName = String(buildCommand.command ?? '').split(/[\\/]/u).pop()?.toLowerCase() ?? '';
+  if (process.platform === 'win32' && /^(npm|npx)(\.cmd|\.bat)?$/iu.test(commandName)) {
+    const escapedArgs = (buildCommand.args ?? [])
+      .map((item) => String(item).replace(/'/gu, "''"))
+      .map((item) => `'${item}'`)
+      .join(' ');
+
+    return runCli(
+      'powershell',
+      ['-NoProfile', '-Command', `& ${commandName} ${escapedArgs}`],
+      options,
+    );
+  }
+
+  return runCli(buildCommand.command, buildCommand.args, options);
 }
 
 function collectLaunchLog(profileDirs) {
@@ -581,11 +635,15 @@ async function main() {
     projectPath,
     windows: devtoolsWindows,
   });
+  const devtoolsCliPlan = buildDevtoolsCliPlan({
+    action: devtoolsOpenAction,
+    projectPath,
+  });
 
   // Hot-reload surrogate: rebuild first so diagnostics read the latest generated output
   // instead of stale DevTools cache state.
   const preflightReload = buildCommand
-    ? runCli(buildCommand.command, buildCommand.args, {
+    ? runBuildCommand(buildCommand, {
         cwd: projectPath,
         timeout: 180000,
       })
@@ -595,22 +653,11 @@ async function main() {
     await sleep(1500);
   }
 
-  const cliOpen =
-    devtoolsOpenAction === 'refresh-existing-project'
-      ? {
-          args: [],
-          spawnedCommand: null,
-          spawnedArgs: [],
-          status: 0,
-          stdout: 'Skipped cli open because target project is already open in WeChat DevTools.',
-          stderr: '',
-          error: null,
-        }
-      : runCli(
-          cliPath,
-          ['open', '--project', projectPath, '--debug'],
-          { cwd: projectPath },
-        );
+  const cliOpen = await runDevtoolsCliPlan(
+    cliPath,
+    devtoolsCliPlan,
+    { cwd: projectPath, stepDelayMs: 2000 },
+  );
 
   const cliAuto = runCli(
     cliPath,
@@ -634,7 +681,7 @@ async function main() {
 
   const buildFallback =
     !miniProgram.currentPage && buildCommand
-      ? runCli(buildCommand.command, buildCommand.args, {
+      ? runBuildCommand(buildCommand, {
           cwd: projectPath,
           timeout: 180000,
         })
@@ -653,6 +700,7 @@ async function main() {
     devToolsRoot,
     devtoolsState: {
       action: devtoolsOpenAction,
+      cliPlan: devtoolsCliPlan,
       windows: devtoolsWindows,
     },
     projectHints: collectProjectHints(projectPath),
