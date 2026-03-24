@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
@@ -8,9 +9,11 @@ import { fileURLToPath } from 'node:url';
 import {
   buildCommandInvocation,
   buildDevtoolsCliPlan,
+  detectDevtoolsCompileCycle,
   detectCliPort,
   determineDevtoolsOpenAction,
   filterLauncherLogSince,
+  filterWeappLogSince,
   pickLatestExistingPath,
   resolvePreferredBuildCommand,
   summarizeTextBlock,
@@ -37,13 +40,16 @@ process.on('uncaughtException', (error) => {
 });
 
 function parseArgs(argv) {
+  const defaultProject = process.cwd();
   const parsed = {
-    project: process.cwd(),
-    outputDir: path.join(process.cwd(), '.codex-artifacts', 'wechat-devtools'),
+    project: defaultProject,
+    outputDir: null,
     autoPort: 9420,
     settleMs: 2500,
     withPreview: false,
     allowExternalBuild: false,
+    includeSystemInfo: false,
+    includeMiniProgramScreenshot: false,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -64,10 +70,30 @@ function parseArgs(argv) {
       parsed.withPreview = true;
     } else if (token === '--allow-external-build') {
       parsed.allowExternalBuild = true;
+    } else if (token === '--include-system-info') {
+      parsed.includeSystemInfo = true;
+    } else if (token === '--include-miniprogram-screenshot') {
+      parsed.includeMiniProgramScreenshot = true;
     }
   }
 
   return parsed;
+}
+
+function resolveDefaultOutputDir(projectPath) {
+  const projectName = path.basename(path.resolve(projectPath)) || 'project';
+  const projectHash = crypto
+    .createHash('sha1')
+    .update(path.resolve(projectPath))
+    .digest('hex')
+    .slice(0, 8);
+
+  return path.join(
+    os.homedir(),
+    '.codex-artifacts',
+    'wechat-devtools',
+    `${projectName}-${projectHash}`,
+  );
 }
 
 function sleep(ms) {
@@ -251,6 +277,93 @@ function collectLaunchLog(profileDirs, startedAt) {
   return latestPath ? filterLauncherLogSince(readUtf8Safe(latestPath), startedAt, 120) : '';
 }
 
+function collectWeappLogCandidates(profileDirs) {
+  const candidates = [];
+
+  for (const profileDir of profileDirs) {
+    const logsRoot = path.join(profileDir, 'WeappLog', 'logs');
+    try {
+      const entries = fs.readdirSync(logsRoot, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isFile() || !/\.log$/iu.test(entry.name)) {
+          continue;
+        }
+
+        const filePath = path.join(logsRoot, entry.name);
+        candidates.push({
+          path: filePath,
+          exists: true,
+          mtimeMs: fs.statSync(filePath).mtimeMs,
+        });
+      }
+    } catch {
+      // ignore missing log roots
+    }
+  }
+
+  return candidates;
+}
+
+function collectWeappRefreshLog(profileDirs, startedAt) {
+  const candidates = collectWeappLogCandidates(profileDirs)
+    .sort((left, right) => right.mtimeMs - left.mtimeMs);
+
+  if (candidates.length === 0) {
+    return {
+      logPath: null,
+      text: '',
+      signature: detectDevtoolsCompileCycle(''),
+    };
+  }
+
+  let fallbackPath = candidates[0].path;
+  let fallbackText = '';
+
+  for (const candidate of candidates) {
+    const text = filterWeappLogSince(readUtf8Safe(candidate.path), startedAt, 200);
+    if (text) {
+      return {
+        logPath: candidate.path,
+        text,
+        signature: detectDevtoolsCompileCycle(text),
+      };
+    }
+
+    if (!fallbackText) {
+      fallbackText = text;
+      fallbackPath = candidate.path;
+    }
+  }
+
+  return {
+    logPath: fallbackPath,
+    text: fallbackText,
+    signature: detectDevtoolsCompileCycle(fallbackText),
+  };
+}
+
+async function waitForDevtoolsRefreshCycle(profileDirs, startedAt, timeoutMs = 15000, pollMs = 500) {
+  const deadline = Date.now() + timeoutMs;
+  let latestObservation = collectWeappRefreshLog(profileDirs, startedAt);
+
+  while (Date.now() < deadline) {
+    latestObservation = collectWeappRefreshLog(profileDirs, startedAt);
+    if (latestObservation.signature.completed) {
+      return {
+        status: 'matched',
+        ...latestObservation,
+      };
+    }
+
+    await sleep(pollMs);
+  }
+
+  return {
+    status: 'timeout',
+    ...latestObservation,
+  };
+}
+
 function collectEditorLogs(profileDirs) {
   const candidates = [];
 
@@ -314,6 +427,81 @@ function captureIdeWindow(scriptPath, outputPath) {
   };
 }
 
+function triggerDevtoolsRefresh(scriptPath, { projectPath, shortcut }) {
+  const projectName = path.basename(projectPath);
+  const result = spawnSync(
+    'powershell',
+    [
+      '-ExecutionPolicy',
+      'Bypass',
+      '-File',
+      scriptPath,
+      '-WindowTitleContains',
+      projectName,
+      '-Shortcut',
+      shortcut,
+    ],
+    {
+      encoding: 'utf8',
+      timeout: 15000,
+    },
+  );
+
+  let payload = null;
+  try {
+    payload = result.stdout.trim() ? JSON.parse(result.stdout) : null;
+  } catch {
+    payload = null;
+  }
+
+  return {
+    status: result.status,
+    shortcut,
+    stdout: summarizeTextBlock(result.stdout, 20),
+    stderr: summarizeTextBlock(result.stderr, 20),
+    payload,
+  };
+}
+
+async function refreshOpenProject(scriptPath, { projectPath, profileDirs, refreshShortcuts }) {
+  const attempts = [];
+
+  for (const shortcut of refreshShortcuts) {
+    const attemptStartedAt = new Date();
+    const trigger = triggerDevtoolsRefresh(scriptPath, { projectPath, shortcut });
+    const cycle = trigger.status === 0
+      ? await waitForDevtoolsRefreshCycle(profileDirs, attemptStartedAt, 15000, 500)
+      : {
+          status: 'trigger-failed',
+          logPath: null,
+          text: '',
+          signature: detectDevtoolsCompileCycle(''),
+        };
+
+    const attempt = {
+      startedAt: attemptStartedAt.toISOString(),
+      shortcut,
+      trigger,
+      cycle,
+    };
+    attempts.push(attempt);
+
+    if (cycle.status === 'matched') {
+      return {
+        status: 'matched',
+        selectedShortcut: shortcut,
+        attempts,
+      };
+    }
+  }
+
+  return {
+    status: 'failed',
+    selectedShortcut: null,
+    attempts,
+  };
+}
+
 function readDevtoolsWindows() {
   const script = [
     'Get-Process',
@@ -343,6 +531,62 @@ function readDevtoolsWindows() {
   } catch {
     return [];
   }
+}
+
+function readListeningWechatDevtoolsPorts() {
+  const script = [
+    '$processIds = @(Get-Process wechatdevtools -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)',
+    "if (-not $processIds -or $processIds.Count -eq 0) { '[]'; exit 0 }",
+    'Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue',
+    '| Where-Object { $processIds -contains $_.OwningProcess }',
+    '| Select-Object LocalPort,OwningProcess',
+    '| Sort-Object LocalPort',
+    '| ConvertTo-Json -Compress',
+  ].join(' ');
+
+  const result = spawnSync('powershell', ['-NoProfile', '-Command', script], {
+    encoding: 'utf8',
+    timeout: 10000,
+  });
+
+  if (result.status !== 0 || !result.stdout.trim()) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(result.stdout);
+    const items = Array.isArray(parsed) ? parsed : [parsed];
+    return items
+      .map((item) => Number.parseInt(String(item.LocalPort), 10))
+      .filter((port) => Number.isInteger(port) && port > 0);
+  } catch {
+    return [];
+  }
+}
+
+function buildAutomationPortCandidates({ preferredPort, listeningPorts = [] }) {
+  const candidates = [];
+  const pushPort = (port) => {
+    const normalized = Number.parseInt(String(port ?? ''), 10);
+    if (!Number.isInteger(normalized) || normalized < 1 || normalized > 65535) {
+      return;
+    }
+    if (!candidates.includes(normalized)) {
+      candidates.push(normalized);
+    }
+  };
+
+  pushPort(preferredPort);
+  pushPort(9420);
+  pushPort(9421);
+
+  for (const port of listeningPorts) {
+    if (port >= 9000 && port <= 65535) {
+      pushPort(port);
+    }
+  }
+
+  return candidates;
 }
 
 function collectProjectHints(projectPath) {
@@ -419,9 +663,10 @@ function detectBuildCommand(projectPath) {
   }
 }
 
-function buildDiagnosis({ projectHints, cli, miniProgram, logs, buildFallback, preflightReload }) {
+function buildDiagnosis({ projectHints, cli, miniProgram, logs, buildFallback, preflightReload, refreshAction }) {
   const findings = [];
   const recommendations = [];
+  const hasAutomationContext = Boolean(miniProgram?.currentPage);
 
   if (projectHints?.miniprogramRoot && projectHints?.miniprogramAppJsonExists === false) {
     findings.push({
@@ -435,6 +680,40 @@ function buildDiagnosis({ projectHints, cli, miniProgram, logs, buildFallback, p
     );
   }
 
+  if (refreshAction?.status === 'failed') {
+    findings.push({
+      severity: hasAutomationContext ? 'medium' : 'high',
+      code: 'DEVTOOLS_NATIVE_REFRESH_FAILED',
+      message: hasAutomationContext
+        ? 'The in-IDE compile signature was not observed this run, but automation context was still captured successfully.'
+        : 'The skill could not reproduce the in-IDE refresh cycle on the already-open project.',
+      evidence: refreshAction.attempts?.map((attempt) =>
+        `${attempt.shortcut}: ${attempt.cycle.status}`,
+      ).join('; ') ?? 'no refresh attempts recorded',
+    });
+    if (!hasAutomationContext) {
+      recommendations.unshift('Keep the target project focused in WeChat DevTools and verify the refresh shortcut has not changed.');
+    }
+  }
+
+  if (refreshAction?.status === 'matched') {
+    findings.push({
+      severity: 'info',
+      code: 'DEVTOOLS_NATIVE_REFRESH_SUCCEEDED',
+      message: `DevTools native refresh succeeded via shortcut ${refreshAction.selectedShortcut}.`,
+      evidence: refreshAction.attempts.at(-1)?.cycle?.text ?? 'matched restart appservice compile -> webview page ready signature',
+    });
+  }
+
+  if (hasAutomationContext) {
+    findings.push({
+      severity: 'info',
+      code: 'AUTOMATION_CONTEXT_CAPTURED',
+      message: `Automation captured currentPage=${miniProgram.currentPage.path}.`,
+      evidence: `connectedPort=${miniProgram.connectedPort ?? 'unknown'}`,
+    });
+  }
+
   if (miniProgram?.warning) {
     findings.push({
       severity: 'medium',
@@ -445,7 +724,11 @@ function buildDiagnosis({ projectHints, cli, miniProgram, logs, buildFallback, p
     recommendations.push('Re-run DevTools automation enablement before relying on currentPage or screenshot collection.');
   }
 
-  if ((miniProgram?.pageStack?.length ?? 0) === 0 && !miniProgram?.currentPage) {
+  if (
+    (miniProgram?.pageStack?.length ?? 0) === 0 &&
+    !miniProgram?.currentPage &&
+    !String(miniProgram?.warning ?? '').includes('automation connect failed')
+  ) {
     findings.push({
       severity: 'medium',
       code: 'NO_RUNNING_PAGE_CONTEXT',
@@ -528,7 +811,13 @@ function buildDiagnosis({ projectHints, cli, miniProgram, logs, buildFallback, p
   };
 }
 
-async function collectMiniProgramSnapshot({ autoPort, outputDir, settleMs }) {
+async function collectMiniProgramSnapshot({
+  autoPorts,
+  outputDir,
+  settleMs,
+  includeSystemInfo = false,
+  includeMiniProgramScreenshot = false,
+}) {
   let automator;
   try {
     automator = require('miniprogram-automator');
@@ -542,15 +831,28 @@ async function collectMiniProgramSnapshot({ autoPort, outputDir, settleMs }) {
   const exceptions = [];
 
   let miniProgram;
-  try {
-    miniProgram = await withTimeout(
-      'automator.connect',
-      () => automator.connect({ wsEndpoint: `ws://127.0.0.1:${autoPort}` }),
-      15000,
-    );
-  } catch (error) {
+  let connectedPort = null;
+  let connectError = null;
+
+  for (const candidatePort of autoPorts) {
+    try {
+      miniProgram = await withTimeout(
+        `automator.connect:${candidatePort}`,
+        () => automator.connect({ wsEndpoint: `ws://127.0.0.1:${candidatePort}` }),
+        15000,
+      );
+      connectedPort = candidatePort;
+      break;
+    } catch (error) {
+      connectError = error;
+    }
+  }
+
+  if (!miniProgram) {
     return {
-      warning: `automation connect failed: ${error.message}`,
+      warning: `automation connect failed: ${connectError?.message ?? 'no usable automation port found'}`,
+      attemptedPorts: autoPorts,
+      connectedPort: null,
       pageStack: [],
       currentPage: null,
       systemInfo: null,
@@ -588,6 +890,8 @@ async function collectMiniProgramSnapshot({ autoPort, outputDir, settleMs }) {
   const screenshotPath = path.join(outputDir, 'miniprogram-preview.png');
 
   const snapshot = {
+    attemptedPorts: autoPorts,
+    connectedPort,
     pageStack: pageStack.map((page) => ({ path: page.path, query: page.query })),
     currentPage: null,
     systemInfo: null,
@@ -596,10 +900,12 @@ async function collectMiniProgramSnapshot({ autoPort, outputDir, settleMs }) {
     exceptions: trimEntries(exceptions, 20),
   };
 
-  try {
-    snapshot.systemInfo = await withTimeout('miniProgram.systemInfo', () => miniProgram.systemInfo(), 10000);
-  } catch {
-    snapshot.systemInfo = null;
+  if (includeSystemInfo) {
+    try {
+      snapshot.systemInfo = await withTimeout('miniProgram.systemInfo', () => miniProgram.systemInfo(), 10000);
+    } catch {
+      snapshot.systemInfo = null;
+    }
   }
 
   if (currentPage) {
@@ -613,11 +919,13 @@ async function collectMiniProgramSnapshot({ autoPort, outputDir, settleMs }) {
     };
   }
 
-  try {
-    await withTimeout('miniProgram.screenshot', () => miniProgram.screenshot({ path: screenshotPath }), 15000);
-    snapshot.screenshotPath = screenshotPath;
-  } catch {
-    snapshot.screenshotPath = null;
+  if (includeMiniProgramScreenshot) {
+    try {
+      await withTimeout('miniProgram.screenshot', () => miniProgram.screenshot({ path: screenshotPath }), 15000);
+      snapshot.screenshotPath = screenshotPath;
+    } catch {
+      snapshot.screenshotPath = null;
+    }
   }
 
   try {
@@ -632,17 +940,23 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   const sessionStartedAt = new Date();
   const projectPath = path.resolve(args.project);
-  const outputDir = path.resolve(args.outputDir);
+  const outputDir = path.resolve(args.outputDir ?? resolveDefaultOutputDir(projectPath));
   ensureDir(outputDir);
 
   const scriptDir = path.dirname(fileURLToPath(import.meta.url));
   const devToolsRoot = findDevToolsRoot();
   const cliPath = path.join(devToolsRoot, 'cli.bat');
+  const refreshScriptPath = path.join(scriptDir, 'trigger-wechat-devtools-refresh.ps1');
   const userDataRoot = resolveUserDataRoot();
   const profileDirs = resolveHashedProfiles(userDataRoot);
-  const autoPort = args.autoPort || 9420;
+  const preferredAutoPort = args.autoPort ?? 9420;
   const buildCommand = args.allowExternalBuild ? detectBuildCommand(projectPath) : null;
   const devtoolsWindows = readDevtoolsWindows();
+  const listeningWechatDevtoolsPorts = readListeningWechatDevtoolsPorts();
+  let automationPortCandidates = buildAutomationPortCandidates({
+    preferredPort: preferredAutoPort,
+    listeningPorts: listeningWechatDevtoolsPorts,
+  });
   const devtoolsOpenAction = determineDevtoolsOpenAction({
     projectPath,
     windows: devtoolsWindows,
@@ -652,6 +966,13 @@ async function main() {
     projectPath,
   });
   const reuseOpenProject = devtoolsOpenAction === 'refresh-existing-project';
+  const refreshAction = reuseOpenProject
+    ? await refreshOpenProject(refreshScriptPath, {
+        projectPath,
+        profileDirs,
+        refreshShortcuts: ['^b'],
+      })
+    : null;
 
   // Hot-reload surrogate: rebuild first so diagnostics read the latest generated output
   // instead of stale DevTools cache state.
@@ -676,9 +997,17 @@ async function main() {
     ? null
     : runCli(
         cliPath,
-        ['auto', '--project', projectPath, '--auto-port', String(autoPort), '--debug', '--trust-project'],
+        ['auto', '--project', projectPath, '--auto-port', String(preferredAutoPort), '--debug', '--trust-project'],
         { cwd: projectPath },
       );
+
+  if (!reuseOpenProject && cliAuto?.status === 0) {
+    await sleep(2000);
+    automationPortCandidates = buildAutomationPortCandidates({
+      preferredPort: preferredAutoPort,
+      listeningPorts: readListeningWechatDevtoolsPorts(),
+    });
+  }
 
   const cliPreview = args.withPreview && !reuseOpenProject
     ? runCli(
@@ -689,9 +1018,11 @@ async function main() {
     : null;
 
   const miniProgram = await collectMiniProgramSnapshot({
-    autoPort,
+    autoPorts: automationPortCandidates,
     outputDir,
     settleMs: args.settleMs,
+    includeSystemInfo: args.includeSystemInfo,
+    includeMiniProgramScreenshot: args.includeMiniProgramScreenshot,
   });
 
   const buildFallback =
@@ -707,22 +1038,30 @@ async function main() {
     path.join(scriptDir, 'capture-wechat-devtools-window.ps1'),
     ideScreenshotPath,
   );
+  const refreshStartedAt = refreshAction?.attempts?.at(-1)?.startedAt
+    ? new Date(refreshAction.attempts.at(-1).startedAt)
+    : sessionStartedAt;
+  const weappLog = collectWeappRefreshLog(profileDirs, refreshStartedAt);
 
   const report = {
     sessionStartedAt: sessionStartedAt.toISOString(),
     createdAt: new Date().toISOString(),
     projectPath,
-    autoPort,
+    autoPort: miniProgram.connectedPort ?? preferredAutoPort,
     devToolsRoot,
     devtoolsState: {
       action: devtoolsOpenAction,
       cliPlan: devtoolsCliPlan,
       buildMode: args.allowExternalBuild ? 'external-build-allowed' : 'devtools-only',
+      reuseOpenProject,
+      automationPortCandidates,
+      listeningWechatDevtoolsPorts,
       windows: devtoolsWindows,
     },
     projectHints: collectProjectHints(projectPath),
     buildCommand,
     preflightReload,
+    refreshAction,
     cli: {
       open: cliOpen,
       auto: cliAuto,
@@ -736,6 +1075,7 @@ async function main() {
     },
     miniProgram,
     logs: {
+      weapp: weappLog,
       launch: collectLaunchLog(profileDirs, sessionStartedAt),
       editor: collectEditorLogs(profileDirs),
       ideScreenshot,

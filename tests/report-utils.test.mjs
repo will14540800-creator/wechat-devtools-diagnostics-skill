@@ -4,9 +4,11 @@ import assert from 'node:assert/strict';
 import {
   buildCommandInvocation,
   buildDevtoolsCliPlan,
+  detectDevtoolsCompileCycle,
   detectCliPort,
   determineDevtoolsOpenAction,
   filterLauncherLogSince,
+  filterWeappLogSince,
   pickLatestExistingPath,
   resolvePreferredBuildCommand,
   trimEntries,
@@ -92,6 +94,57 @@ test('filterLauncherLogSince returns empty text when launcher did not restart th
   );
 
   assert.equal(result, '');
+});
+
+test('filterWeappLogSince keeps only current-run weapp log lines', () => {
+  const startedAt = new Date(2026, 2, 24, 18, 34, 58);
+  const result = filterWeappLogSince(
+    [
+      '[2026-03-24 18:34:57.999][INFO] old',
+      '[2026-03-24 18:34:58.501][INFO] restart appservice compile',
+      '[2026-03-24 18:35:02.085][INFO] webview page ready',
+    ].join('\n'),
+    startedAt,
+    20,
+  );
+
+  assert.equal(
+    result,
+    [
+      '[2026-03-24 18:34:58.501][INFO] restart appservice compile',
+      '[2026-03-24 18:35:02.085][INFO] webview page ready',
+    ].join('\n'),
+  );
+});
+
+test('detectDevtoolsCompileCycle recognizes a complete devtools-native refresh', () => {
+  const signature = detectDevtoolsCompileCycle(
+    [
+      '[2026-03-24 18:34:58.501][INFO] restart appservice compile',
+      '[2026-03-24 18:34:59.293][INFO] appservice reload',
+      '[2026-03-24 18:35:02.085][INFO] webview page ready',
+    ].join('\n'),
+  );
+
+  assert.deepEqual(signature, {
+    completed: true,
+    hasRestartCompile: true,
+    hasAppserviceReload: true,
+    hasPageReady: true,
+  });
+});
+
+test('detectDevtoolsCompileCycle rejects incomplete refresh logs', () => {
+  const signature = detectDevtoolsCompileCycle(
+    '[2026-03-24 18:34:59.293][INFO] appservice reload',
+  );
+
+  assert.deepEqual(signature, {
+    completed: false,
+    hasRestartCompile: false,
+    hasAppserviceReload: true,
+    hasPageReady: false,
+  });
 });
 
 test('buildCommandInvocation wraps Windows bat paths with spaces via cmd.exe', () => {
