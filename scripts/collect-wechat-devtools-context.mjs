@@ -43,6 +43,7 @@ function parseArgs(argv) {
     autoPort: 9420,
     settleMs: 2500,
     withPreview: false,
+    allowExternalBuild: false,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -61,6 +62,8 @@ function parseArgs(argv) {
       index += 1;
     } else if (token === '--with-preview') {
       parsed.withPreview = true;
+    } else if (token === '--allow-external-build') {
+      parsed.allowExternalBuild = true;
     }
   }
 
@@ -175,7 +178,7 @@ async function runDevtoolsCliPlan(cliPath, plan, options = {}) {
     return {
       status: 0,
       args: [],
-      stdout: 'skipped project-open CLI because target project is already open; using external rebuild only',
+      stdout: 'skipped project-open CLI because target project is already open; using devtools-only diagnostics flow',
       stderr: '',
       error: null,
       steps: [],
@@ -638,7 +641,7 @@ async function main() {
   const userDataRoot = resolveUserDataRoot();
   const profileDirs = resolveHashedProfiles(userDataRoot);
   const autoPort = args.autoPort || 9420;
-  const buildCommand = detectBuildCommand(projectPath);
+  const buildCommand = args.allowExternalBuild ? detectBuildCommand(projectPath) : null;
   const devtoolsWindows = readDevtoolsWindows();
   const devtoolsOpenAction = determineDevtoolsOpenAction({
     projectPath,
@@ -714,6 +717,7 @@ async function main() {
     devtoolsState: {
       action: devtoolsOpenAction,
       cliPlan: devtoolsCliPlan,
+      buildMode: args.allowExternalBuild ? 'external-build-allowed' : 'devtools-only',
       windows: devtoolsWindows,
     },
     projectHints: collectProjectHints(projectPath),
